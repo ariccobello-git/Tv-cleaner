@@ -1,0 +1,836 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Crea i file del progetto
+        run: |
+          mkdir -p app app/src/main app/src/main/java/app/tvcleaner app/src/main/res/drawable app/src/main/res/values app/src/main/res/xml
+          cat > app/build.gradle.kts <<'TVC_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "app.tvcleaner"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "app.tvcleaner"
+                  minSdk = 24
+                  targetSdk = 28
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+              }
+          }
+          TVC_EOF
+          cat > app/src/main/AndroidManifest.xml <<'TVC_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:banner="@drawable/banner"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CleanerService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          TVC_EOF
+          cat > app/src/main/java/app/tvcleaner/Apps.kt <<'TVC_EOF'
+          package app.tvcleaner
+
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageManager
+
+          data class AppItem(
+              val pkg: String,
+              val label: String,
+              val stopped: Boolean,
+              val enabled: Boolean,
+              val protectedApp: Boolean
+          )
+
+          object Apps {
+              private val PROT_EXACT = setOf(
+                  "android", "com.android.tv.settings", "com.android.settings",
+                  "com.google.android.tvlauncher", "com.google.android.leanbacklauncher",
+                  "com.google.android.tvrecommendations", "com.google.android.gms",
+                  "com.google.android.gsf", "com.android.systemui",
+                  "com.android.packageinstaller", "com.google.android.packageinstaller",
+                  "com.android.shell"
+              )
+              private val PROT_PREFIX = listOf(
+                  "com.android.providers.", "com.android.inputmethod",
+                  "com.google.android.inputmethod", "com.android.bluetooth", "com.android.phone"
+              )
+
+              fun homePkg(c: Context): String? {
+                  val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                  return c.packageManager.resolveActivity(i, PackageManager.MATCH_DEFAULT_ONLY)
+                      ?.activityInfo?.packageName
+              }
+
+              fun isProtected(c: Context, pkg: String): Boolean {
+                  if (pkg == c.packageName || pkg in PROT_EXACT) return true
+                  if (PROT_PREFIX.any { pkg.startsWith(it) }) return true
+                  return pkg == homePkg(c)
+              }
+
+              fun list(c: Context, showAll: Boolean): List<AppItem> {
+                  val pm = c.packageManager
+                  val launchable = HashSet<String>()
+                  for (cat in listOf(Intent.CATEGORY_LAUNCHER, Intent.CATEGORY_LEANBACK_LAUNCHER)) {
+                      val i = Intent(Intent.ACTION_MAIN).addCategory(cat)
+                      for (r in pm.queryIntentActivities(i, 0)) launchable.add(r.activityInfo.packageName)
+                  }
+                  val out = ArrayList<AppItem>()
+                  for (ai in pm.getInstalledApplications(PackageManager.GET_META_DATA)) {
+                      val isSystem = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                      if (!(showAll || !ai.enabled || !isSystem || ai.packageName in launchable)) continue
+                      val label = try { pm.getApplicationLabel(ai).toString() } catch (e: Exception) { ai.packageName }
+                      out.add(
+                          AppItem(
+                              ai.packageName, label,
+                              (ai.flags and ApplicationInfo.FLAG_STOPPED) != 0,
+                              ai.enabled,
+                              isProtected(c, ai.packageName)
+                          )
+                      )
+                  }
+                  // prima le avviate, poi le ferme, poi le disattivate; ordine alfabetico
+                  return out.sortedWith(
+                      compareBy<AppItem>({ if (!it.enabled) 2 else if (it.stopped) 1 else 0 }, { it.label.lowercase() })
+                  )
+              }
+
+              private fun info(c: Context, pkg: String): ApplicationInfo? =
+                  try { c.packageManager.getApplicationInfo(pkg, 0) } catch (e: Exception) { null }
+
+              /** Lavori automatici: app in modalita' Guardiano avviate e app in modalita' Disattiva. */
+              fun autoJobs(c: Context): List<Pair<String, Int>> {
+                  val out = ArrayList<Pair<String, Int>>()
+                  for ((pkg, m) in Prefs.allModes(c)) {
+                      if (isProtected(c, pkg)) continue
+                      val ai = info(c, pkg) ?: continue
+                      val stopped = (ai.flags and ApplicationInfo.FLAG_STOPPED) != 0
+                      when (m) {
+                          Prefs.GUARDIANO -> if (ai.enabled && !stopped) out.add(pkg to CleanerService.STOP)
+                          Prefs.DISATTIVA -> if (ai.enabled) out.add(pkg to CleanerService.DISABLE)
+                      }
+                  }
+                  return out
+              }
+
+              /** Lavori manuali: automatici + (se everything) arresta tutte le avviate non protette + riattiva quelle tolte dalla lista. */
+              fun manualJobs(c: Context, everything: Boolean): List<Pair<String, Int>> {
+                  val out = ArrayList(autoJobs(c))
+                  val modes = Prefs.allModes(c)
+                  if (everything) {
+                      for (a in list(c, false)) {
+                          if (a.protectedApp || !a.enabled || a.stopped) continue
+                          if ((modes[a.pkg] ?: Prefs.LIBERA) == Prefs.PROTETTA) continue
+                          if (out.none { it.first == a.pkg }) out.add(a.pkg to CleanerService.STOP)
+                      }
+                  }
+                  for (pkg in Prefs.byUs(c)) {
+                      val ai = info(c, pkg) ?: continue
+                      if (!ai.enabled && (modes[pkg] ?: Prefs.LIBERA) != Prefs.DISATTIVA) {
+                          out.add(pkg to CleanerService.ENABLE)
+                      }
+                  }
+                  return out
+              }
+          }
+          TVC_EOF
+          cat > app/src/main/java/app/tvcleaner/CleanerService.kt <<'TVC_EOF'
+          package app.tvcleaner
+
+          import android.accessibilityservice.AccessibilityService
+          import android.app.ActivityManager
+          import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.os.SystemClock
+          import android.provider.Settings
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.Toast
+
+          class CleanerService : AccessibilityService() {
+
+              companion object {
+                  @Volatile var instance: CleanerService? = null
+                  const val STOP = 0
+                  const val DISABLE = 1
+                  const val ENABLE = 2
+
+                  private val STOP_LABELS = listOf(
+                      "Termina forzatamente", "Arresta forzatamente", "Forza arresto",
+                      "Forza chiusura", "Arresta", "Termina", "Force stop", "Force close"
+                  )
+                  private val DISABLE_LABELS = listOf("Disattiva", "Disabilita", "Disable")
+                  private val ENABLE_LABELS = listOf("Attiva", "Abilita", "Enable")
+                  private val CONFIRM_STOP = listOf("OK", "Ok", "Sì", "Si", "Yes", "Conferma", "Confirm")
+                  private val CONFIRM_DISABLE = CONFIRM_STOP + listOf("Disattiva app", "Disable app", "Disattiva", "Disable")
+              }
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val queue = ArrayList<Pair<String, Int>>()
+              private var cur: Pair<String, Int>? = null
+              private var running = false
+              private var returnToApp = false
+              private var state = 0 // 0 inattivo, 1 cerco il pulsante, 2 cerco la conferma
+              private var tStart = 0L
+              private var okCount = 0
+              private var failCount = 0
+
+              @Volatile var lastTexts: List<String> = emptyList()
+              @Volatile var foreground: String = ""
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+                  handler.postDelayed(guardTick, 60_000L)
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  handler.removeCallbacksAndMessages(null)
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  handler.removeCallbacksAndMessages(null)
+                  super.onDestroy()
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                      val p = event.packageName?.toString()
+                      if (!p.isNullOrEmpty()) foreground = p
+                  }
+              }
+
+              // ---------- coda dei lavori ----------
+
+              fun enqueue(jobs: List<Pair<String, Int>>, backToApp: Boolean) {
+                  handler.post {
+                      for (j in jobs) {
+                          if (j == cur || queue.contains(j)) continue
+                          if (j.second == DISABLE) Prefs.addByUs(this, j.first)
+                          if (j.second == ENABLE) Prefs.removeByUs(this, j.first)
+                          queue.add(j)
+                      }
+                      if (!running) {
+                          running = true
+                          returnToApp = backToApp
+                          okCount = 0
+                          failCount = 0
+                          next()
+                      }
+                  }
+              }
+
+              private fun next() {
+                  if (queue.isEmpty()) {
+                      finishAll()
+                      return
+                  }
+                  val job = queue.removeAt(0)
+                  cur = job
+                  state = 1
+                  tStart = SystemClock.uptimeMillis()
+                  if (job.second == STOP) {
+                      try {
+                          (getSystemService(ACTIVITY_SERVICE) as ActivityManager).killBackgroundProcesses(job.first)
+                      } catch (e: Exception) { }
+                  }
+                  try {
+                      val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + job.first))
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                      startActivity(i)
+                  } catch (e: Exception) {
+                      failCount++
+                      cur = null
+                      state = 0
+                      handler.postDelayed({ next() }, 300)
+                      return
+                  }
+                  handler.postDelayed(tick, 1200)
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      val job = cur ?: return
+                      val now = SystemClock.uptimeMillis()
+                      val root = rootInActiveWindow
+                      val mine = root?.packageName?.toString() == packageName
+                      if (root != null && !mine) captureTexts(root)
+
+                      if (root != null && !mine) {
+                          if (state == 1) {
+                              val labels = when (job.second) {
+                                  STOP -> STOP_LABELS
+                                  DISABLE -> DISABLE_LABELS
+                                  else -> ENABLE_LABELS
+                              }
+                              val node = findExact(root, labels)
+                              if (node != null) {
+                                  if (!node.isEnabled) {
+                                      finishJob(job, true) // gia' ferma: pulsante spento
+                                      return
+                                  }
+                                  if (clickNode(node)) {
+                                      if (job.second == ENABLE) {
+                                          handler.postDelayed({ finishJob(job, null) }, 1200)
+                                          return
+                                      }
+                                      state = 2
+                                      tStart = now
+                                      handler.postDelayed(this, 700)
+                                      return
+                                  }
+                              }
+                          } else if (state == 2) {
+                              val conf = if (job.second == DISABLE) CONFIRM_DISABLE else CONFIRM_STOP
+                              val node = findExact(root, conf)
+                              if (node != null && clickNode(node)) {
+                                  handler.postDelayed({ finishJob(job, null) }, 1000)
+                                  state = 3
+                                  return
+                              }
+                              if (now - tStart > 3000) {
+                                  finishJob(job, null)
+                                  return
+                              }
+                          }
+                      }
+                      if (state == 3) return
+                      if (now - tStart > 9000) {
+                          finishJob(job, null)
+                          return
+                      }
+                      handler.postDelayed(this, 500)
+                  }
+              }
+
+              private fun finishJob(job: Pair<String, Int>, ok: Boolean?) {
+                  val good = ok ?: verify(job)
+                  if (good) okCount++ else failCount++
+                  cur = null
+                  state = 0
+                  performGlobalAction(GLOBAL_ACTION_BACK)
+                  handler.postDelayed({ next() }, 700)
+              }
+
+              private fun verify(job: Pair<String, Int>): Boolean {
+                  return try {
+                      val ai = packageManager.getApplicationInfo(job.first, 0)
+                      when (job.second) {
+                          STOP -> (ai.flags and ApplicationInfo.FLAG_STOPPED) != 0
+                          DISABLE -> !ai.enabled
+                          else -> ai.enabled
+                      }
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              private fun finishAll() {
+                  running = false
+                  Toast.makeText(this, "TV Cleaner: $okCount riuscite, $failCount non riuscite", Toast.LENGTH_LONG).show()
+                  if (returnToApp) {
+                      try {
+                          val i = Intent(this, MainActivity::class.java)
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                          startActivity(i)
+                      } catch (e: Exception) {
+                          performGlobalAction(GLOBAL_ACTION_HOME)
+                      }
+                  } else {
+                      performGlobalAction(GLOBAL_ACTION_HOME)
+                  }
+              }
+
+              // ---------- ricerca e click dei pulsanti ----------
+
+              private fun findExact(root: AccessibilityNodeInfo, labels: List<String>): AccessibilityNodeInfo? {
+                  for (l in labels) {
+                      val list = root.findAccessibilityNodeInfosByText(l) ?: continue
+                      for (n in list) {
+                          val t = n.text?.toString()?.trim()
+                          if (t != null && t.equals(l, ignoreCase = true)) return n
+                      }
+                  }
+                  return null
+              }
+
+              private fun clickNode(n: AccessibilityNodeInfo): Boolean {
+                  var x: AccessibilityNodeInfo? = n
+                  var depth = 0
+                  while (x != null && depth < 6) {
+                      if (x.isClickable && x.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                      x = x.parent
+                      depth++
+                  }
+                  return n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+              }
+
+              private fun walk(n: AccessibilityNodeInfo?, d: Int, out: MutableList<String>) {
+                  if (n == null || d > 12 || out.size >= 60) return
+                  val t = n.text?.toString()?.trim()
+                  if (!t.isNullOrEmpty()) out.add(t)
+                  for (i in 0 until n.childCount) walk(n.getChild(i), d + 1, out)
+              }
+
+              private fun captureTexts(root: AccessibilityNodeInfo) {
+                  val out = ArrayList<String>()
+                  walk(root, 0, out)
+                  if (out.isNotEmpty()) lastTexts = out.distinct()
+              }
+
+              // ---------- Guardiano ----------
+
+              private val guardTick = object : Runnable {
+                  override fun run() {
+                      try {
+                          if (Prefs.guard(this@CleanerService) && !running) runGuard()
+                      } catch (e: Exception) { }
+                      handler.postDelayed(this, Prefs.minutes(this@CleanerService) * 60_000L)
+                  }
+              }
+
+              private fun runGuard() {
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  if (!pm.isInteractive) return
+                  val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+                  if (audio.isMusicActive) return // sta guardando/ascoltando qualcosa
+                  if (foreground != Apps.homePkg(this)) return // agisce solo se sei nella schermata Home
+                  val jobs = Apps.autoJobs(this).filter { it.second == STOP }
+                  if (jobs.isNotEmpty()) enqueue(jobs, false)
+              }
+          }
+          TVC_EOF
+          cat > app/src/main/java/app/tvcleaner/MainActivity.kt <<'TVC_EOF'
+          package app.tvcleaner
+
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.drawable.ColorDrawable
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var ramText: TextView
+              private lateinit var list: ListView
+              private lateinit var btnGuard: Button
+              private lateinit var btnShow: Button
+              private lateinit var btnInt: Button
+              private val adapter = AppAdapter()
+              private var items: List<AppItem> = emptyList()
+              private var showAll = false
+              private val handler = Handler(Looper.getMainLooper())
+
+              private val ramTick = object : Runnable {
+                  override fun run() {
+                      updateRam()
+                      handler.postDelayed(this, 2000)
+                  }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+
+              private fun btn(label: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.isAllCaps = false
+                  b.setOnClickListener { onClick() }
+                  b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  return b
+              }
+
+              private fun row(vararg views: View): LinearLayout {
+                  val r = LinearLayout(this)
+                  r.orientation = LinearLayout.HORIZONTAL
+                  for (v in views) r.addView(v)
+                  return r
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(0xFF121212.toInt())
+                  root.setPadding(dp(32), dp(12), dp(32), dp(12))
+
+                  val title = TextView(this)
+                  title.text = "TV Cleaner"
+                  title.textSize = 24f
+                  title.setTextColor(0xFFFFFFFF.toInt())
+                  root.addView(title)
+
+                  ramText = TextView(this)
+                  ramText.textSize = 16f
+                  ramText.setTextColor(0xFF90CAF9.toInt())
+                  root.addView(ramText)
+
+                  btnGuard = btn("Guardiano") { toggleGuard() }
+                  btnShow = btn("Mostra") { showAll = !showAll; reload() }
+                  btnInt = btn("Intervallo") { cycleInterval() }
+
+                  root.addView(row(
+                      btn("Pulisci ora") { runJobs(false) },
+                      btn("Arresta tutte") { runJobs(true) },
+                      btnGuard,
+                      btn("Accessibilità") { openAccessibility() }
+                  ))
+                  root.addView(row(
+                      btn("Aggiorna") { reload() },
+                      btnShow,
+                      btnInt,
+                      btn("Diagnostica") { showDiagnostic() }
+                  ))
+
+                  val hint = TextView(this)
+                  hint.text = "Premi OK su un'app per cambiare modalità: Libera → Protetta → Guardiano → Disattiva"
+                  hint.textSize = 14f
+                  hint.setTextColor(0xFFBDBDBD.toInt())
+                  hint.setPadding(0, dp(8), 0, dp(4))
+                  root.addView(hint)
+
+                  list = ListView(this)
+                  list.adapter = adapter
+                  list.selector = ColorDrawable(0x553399FF)
+                  list.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      val a = items[pos]
+                      if (a.protectedApp) {
+                          toast("App di sistema essenziale: resta protetta")
+                      } else {
+                          val next = (Prefs.mode(this, a.pkg) + 1) % 4
+                          Prefs.setMode(this, a.pkg, next)
+                          adapter.notifyDataSetChanged()
+                      }
+                  }
+                  root.addView(list)
+                  setContentView(root)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  reload()
+                  handler.post(ramTick)
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  handler.removeCallbacks(ramTick)
+              }
+
+              private fun reload() {
+                  items = Apps.list(this, showAll)
+                  adapter.notifyDataSetChanged()
+                  btnShow.text = if (showAll) "Mostra: tutte" else "Mostra: principali"
+                  btnGuard.text = if (Prefs.guard(this)) "Guardiano: ON" else "Guardiano: OFF"
+                  btnInt.text = "Ogni " + Prefs.minutes(this) + " min"
+              }
+
+              private fun updateRam() {
+                  val mi = ActivityManager.MemoryInfo()
+                  (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+                  val free = mi.availMem / 1048576
+                  val tot = if (mi.totalMem > 0) mi.totalMem / 1048576 else 1
+                  val svc = if (CleanerService.instance != null) "ATTIVO" else "NON attivo (premi Accessibilità)"
+                  ramText.text = "RAM libera: $free MB su $tot MB (${100 * free / tot}%)   |   Servizio: $svc"
+              }
+
+              private fun runJobs(everything: Boolean) {
+                  val svc = CleanerService.instance
+                  if (svc == null) {
+                      toast("Prima attiva TV Cleaner nelle impostazioni di Accessibilità")
+                      openAccessibility()
+                      return
+                  }
+                  val jobs = Apps.manualJobs(this, everything)
+                  if (jobs.isEmpty()) {
+                      toast("Niente da fare: tutto è già fermo")
+                      return
+                  }
+                  toast("Avvio ${jobs.size} operazioni. Non toccare il telecomando finché non finisce.")
+                  svc.enqueue(jobs, true)
+              }
+
+              private fun toggleGuard() {
+                  Prefs.setGuard(this, !Prefs.guard(this))
+                  reload()
+                  if (Prefs.guard(this) && CleanerService.instance == null) {
+                      toast("Il Guardiano funziona solo con il servizio di Accessibilità attivo")
+                  }
+              }
+
+              private fun cycleInterval() {
+                  val opts = intArrayOf(5, 10, 20, 30, 60)
+                  val cur = Prefs.minutes(this)
+                  val idx = opts.indexOf(cur)
+                  Prefs.setMinutes(this, opts[(idx + 1) % opts.size])
+                  reload()
+                  toast("Il nuovo intervallo vale dal prossimo controllo")
+              }
+
+              private fun openAccessibility() {
+                  try {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  } catch (e: Exception) {
+                      try { startActivity(Intent(Settings.ACTION_SETTINGS)) } catch (e2: Exception) { }
+                      toast("Vai in Preferenze dispositivo → Accessibilità → TV Cleaner → Attiva")
+                  }
+              }
+
+              private fun showDiagnostic() {
+                  val svc = CleanerService.instance
+                  val msg = if (svc == null) {
+                      "Servizio di accessibilità NON attivo."
+                  } else {
+                      "Ultima schermata di sistema letta:\n\n" +
+                          (if (svc.lastTexts.isEmpty()) "(nessuna ancora)" else svc.lastTexts.joinToString("\n"))
+                  }
+                  AlertDialog.Builder(this).setTitle("Diagnostica").setMessage(msg)
+                      .setPositiveButton("OK", null).show()
+              }
+
+              private inner class AppAdapter : BaseAdapter() {
+                  override fun getCount() = items.size
+                  override fun getItem(position: Int): Any = items[position]
+                  override fun getItemId(position: Int) = position.toLong()
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                      val tv = (convertView as? TextView) ?: TextView(this@MainActivity).also {
+                          it.textSize = 18f
+                          it.setPadding(dp(16), dp(10), dp(16), dp(10))
+                      }
+                      val a = items[position]
+                      val mode = if (a.protectedApp) "PROTETTA (sistema)" else Prefs.MODE_NAMES[Prefs.mode(this@MainActivity, a.pkg)]
+                      val state = if (!a.enabled) "disattivata" else if (a.stopped) "ferma" else "avviata"
+                      tv.text = "${a.label}   →  $mode   [$state]"
+                      tv.setTextColor(
+                          if (!a.enabled) 0xFFFF8A80.toInt()
+                          else if (!a.stopped) 0xFFA5D6A7.toInt()
+                          else 0xFFBDBDBD.toInt()
+                      )
+                      return tv
+                  }
+              }
+          }
+          TVC_EOF
+          cat > app/src/main/java/app/tvcleaner/Prefs.kt <<'TVC_EOF'
+          package app.tvcleaner
+
+          import android.content.Context
+
+          object Prefs {
+              const val LIBERA = 0
+              const val PROTETTA = 1
+              const val GUARDIANO = 2
+              const val DISATTIVA = 3
+              val MODE_NAMES = arrayOf("Libera", "Protetta", "Guardiano", "Disattiva")
+
+              private fun sp(c: Context) = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
+              fun mode(c: Context, pkg: String): Int = sp(c).getInt("m_$pkg", LIBERA)
+
+              fun setMode(c: Context, pkg: String, m: Int) {
+                  sp(c).edit().putInt("m_$pkg", m).apply()
+              }
+
+              fun allModes(c: Context): Map<String, Int> {
+                  val out = HashMap<String, Int>()
+                  for ((k, v) in sp(c).all) {
+                      if (k.startsWith("m_") && v is Int) out[k.removePrefix("m_")] = v
+                  }
+                  return out
+              }
+
+              fun guard(c: Context): Boolean = sp(c).getBoolean("guard", false)
+              fun setGuard(c: Context, v: Boolean) {
+                  sp(c).edit().putBoolean("guard", v).apply()
+              }
+
+              fun minutes(c: Context): Int = sp(c).getInt("minutes", 10)
+              fun setMinutes(c: Context, v: Int) {
+                  sp(c).edit().putInt("minutes", v).apply()
+              }
+
+              fun byUs(c: Context): Set<String> = HashSet(sp(c).getStringSet("byus", emptySet()) ?: emptySet())
+              fun addByUs(c: Context, pkg: String) {
+                  val s = HashSet(byUs(c)); s.add(pkg)
+                  sp(c).edit().putStringSet("byus", s).apply()
+              }
+              fun removeByUs(c: Context, pkg: String) {
+                  val s = HashSet(byUs(c)); s.remove(pkg)
+                  sp(c).edit().putStringSet("byus", s).apply()
+              }
+          }
+          TVC_EOF
+          cat > app/src/main/res/drawable/banner.xml <<'TVC_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="320dp"
+              android:height="180dp"
+              android:viewportWidth="320"
+              android:viewportHeight="180">
+              <path android:fillColor="#1E88E5" android:pathData="M0,0h320v180h-320z" />
+              <path android:fillColor="#FFFFFF" android:pathData="M160,45A45,45 0 1,1 160,135A45,45 0 1,1 160,45z" />
+              <path android:fillColor="#1E88E5" android:pathData="M152,62h16v52h-16z" />
+          </vector>
+          TVC_EOF
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'TVC_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#1E88E5" android:pathData="M0,0h108v108h-108z" />
+              <path android:fillColor="#FFFFFF" android:pathData="M54,24A30,30 0 1,1 54,84A30,30 0 1,1 54,24z" />
+              <path android:fillColor="#1E88E5" android:pathData="M48,38h12v32h-12z" />
+          </vector>
+          TVC_EOF
+          cat > app/src/main/res/values/strings.xml <<'TVC_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">TV Cleaner</string>
+              <string name="service_desc">Permette a TV Cleaner di premere da solo "Arresta forzatamente" nelle impostazioni delle app, per chiudere le app che non servono.</string>
+          </resources>
+          TVC_EOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'TVC_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/service_desc" />
+          TVC_EOF
+          cat > build.gradle.kts <<'TVC_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          TVC_EOF
+          cat > gradle.properties <<'TVC_EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          TVC_EOF
+          cat > settings.gradle.kts <<'TVC_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TvCleaner"
+          include(":app")
+          TVC_EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Compila l'APK
+        run: gradle assembleDebug --no-daemon
+      - name: Pubblica l'APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: TV Cleaner v${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
